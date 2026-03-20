@@ -81,10 +81,20 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_cooldown_steps = int(os.environ.get("MUON_MOMENTUM_COOLDOWN_STEPS", 50))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.02))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    # Value embeddings (from modded-nanogpt): separate embedding tables injected as V deltas.
+    num_value_embeds = int(os.environ.get("NUM_VALUE_EMBEDS", 2))
+    value_embed_lr = float(os.environ.get("VALUE_EMBED_LR", 0.3))
+    # Smear gate: mix previous token's embedding into current token (from modded-nanogpt).
+    enable_smear_gate = bool(int(os.environ.get("ENABLE_SMEAR_GATE", "1")))
+    # Multi-token prediction: weighted loss over next N tokens (from modded-nanogpt).
+    mtp_n_predict = int(os.environ.get("MTP_N_PREDICT", 2))
+    mtp_weights_str = os.environ.get("MTP_WEIGHTS", "1.0,0.5")
 
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
@@ -93,16 +103,9 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
+# MUON OPTIMIZER (from modded-nanogpt, https://kellerjordan.github.io/posts/muon/)
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -117,10 +120,12 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 nesterov: bool = True, weight_decay: float = 0.0):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
+                 nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -142,6 +147,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            wd = group["weight_decay"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -169,6 +175,11 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                # Cautious decoupled weight decay (from modded-nanogpt):
+                # Only apply WD when update direction aligns with param direction.
+                if wd > 0:
+                    mask = (g * p.data).sum(dim=-1, keepdim=True) >= 0
+                    p.data.mul_(1 - lr * wd * mask.float())
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -658,6 +669,19 @@ class Block(nn.Module):
         return x
 
 
+class SmearGate(nn.Module):
+    """Mix previous token's embedding into current token (from modded-nanogpt @classiclarryd)."""
+    def __init__(self, dim: int, gate_dim: int = 12):
+        super().__init__()
+        self.gate_dim = min(gate_dim, dim)
+        self.gate = CastedLinear(self.gate_dim, 1, bias=False)
+
+    def forward(self, x: Tensor, smear_lambda: Tensor) -> Tensor:
+        # x: (bsz, seqlen, dim)
+        gate_out = smear_lambda * torch.sigmoid(self.gate(x[:, 1:, :self.gate_dim]))
+        return torch.cat([x[:, :1], x[:, 1:] + gate_out * x[:, :-1]], dim=1)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -672,6 +696,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        num_value_embeds: int = 0,
+        enable_smear_gate: bool = False,
+        mtp_n_predict: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -679,11 +706,24 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.mtp_n_predict = mtp_n_predict
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+
+        # Value embeddings from modded-nanogpt (@KoszarskyB, @Grad62304977).
+        # Separate embedding tables injected as V deltas at specific layers.
+        self.num_value_embeds = num_value_embeds
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(num_value_embeds)])
+        for ve in self.value_embeds:
+            nn.init.zeros_(ve.weight)
+
+        # Smear gate from modded-nanogpt (@classiclarryd): mixes previous token context.
+        self.smear_gate = SmearGate(model_dim) if enable_smear_gate else None
+        self.smear_lambda = nn.Parameter(torch.zeros(1, dtype=torch.float32)) if enable_smear_gate else None
+
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -703,6 +743,20 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self._init_weights()
 
+    def _value_embed_schedule(self, layer_idx: int) -> int | None:
+        """Map layer index to value embed index, or None. Spreads embeds across layers."""
+        if self.num_value_embeds == 0:
+            return None
+        L = self.num_encoder_layers + self.num_decoder_layers
+        # Spread value embeds: last N layers get embeds 0..N-1
+        start = L - self.num_value_embeds
+        if layer_idx >= start:
+            return layer_idx - start
+        # Also inject at early layers if we have room
+        if self.num_value_embeds >= 2 and layer_idx < self.num_value_embeds - 1:
+            return layer_idx + 1  # offset by 1 so embed 0 goes to last layer
+        return None
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -713,13 +767,34 @@ class GPT(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor, lora=None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+
+        # Smear gate: mix previous token embedding forward 1 position
+        if self.smear_gate is not None:
+            x = self.smear_gate(x, self.smear_lambda)
+
         x0 = x
         skips: list[Tensor] = []
+
+        # Precompute value embeddings for layers that need them
+        ve_lookup: dict[int, Tensor] = {}
+        if self.num_value_embeds > 0:
+            ve_raw = [ve(input_ids) for ve in self.value_embeds]
+            L = self.num_encoder_layers + self.num_decoder_layers
+            for li in range(L):
+                vi = self._value_embed_schedule(li)
+                if vi is not None:
+                    ve_lookup[li] = ve_raw[vi]
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             qd = lora.q_loras[i] if lora else None
-            vd = lora.v_loras[i] if lora else None
+            # Inject value embed as v_delta if scheduled for this layer
+            vd_base = ve_lookup.get(i)
+            if lora:
+                vd_lora = lora.v_loras[i]
+                vd = (lambda n, vdb=vd_base, vdl=vd_lora: (vdb if vdb is not None else 0) + vdl(n)) if vd_lora else None
+            else:
+                vd = (lambda n, vdb=vd_base: vdb) if vd_base is not None else None
             x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
         for i in range(self.num_decoder_layers):
@@ -727,7 +802,12 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             qd = lora.q_loras[bi] if lora else None
-            vd = lora.v_loras[bi] if lora else None
+            vd_base = ve_lookup.get(bi)
+            if lora:
+                vd_lora = lora.v_loras[bi]
+                vd = (lambda n, vdb=vd_base, vdl=vd_lora: (vdb if vdb is not None else 0) + vdl(n)) if vd_lora else None
+            else:
+                vd = (lambda n, vdb=vd_base: vdb) if vd_base is not None else None
             x = self.blocks[bi](x, x0, qd, vd)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -740,6 +820,23 @@ class GPT(nn.Module):
             bsz, sl, V = logits.shape
             return F.cross_entropy(
                 logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="none").reshape(bsz, sl)
+
+        # Multi-token prediction (from modded-nanogpt @varunneal)
+        if self.training and self.mtp_n_predict > 1:
+            logits_flat = logits.float().reshape(-1, logits.size(-1))
+            targets_flat = target_ids.reshape(-1)
+            n = self.mtp_n_predict
+            idx = F.pad(targets_flat, (0, n - 1)).unfold(0, n, 1)
+            target_logits = logits_flat.gather(1, idx)
+            cross_entropy = torch.logsumexp(logits_flat, dim=-1).unsqueeze(1) - target_logits
+            for k in range(1, n):
+                cross_entropy[-k:, k] = 0
+            # Weights: e.g. [1.0, 0.5] normalized
+            weights = torch.tensor([float(w) for w in Hyperparameters.mtp_weights_str.split(",")][:n],
+                                   device=logits.device, dtype=torch.float32)
+            weights = weights / weights.sum()
+            return (cross_entropy * weights).sum() / targets_flat.numel()
+
         return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), target_ids.reshape(-1), reduction="mean")
 
 
@@ -1065,6 +1162,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        num_value_embeds=args.num_value_embeds,
+        enable_smear_gate=args.enable_smear_gate,
+        mtp_n_predict=args.mtp_n_predict,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1093,9 +1193,16 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # Smear gate scalar params
+    if base_model.smear_lambda is not None:
+        scalar_params.append(base_model.smear_lambda)
+    if base_model.smear_gate is not None:
+        for p in base_model.smear_gate.parameters():
+            scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    tok_params = [base_model.tok_emb.weight]
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": tok_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1105,6 +1212,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1115,6 +1223,16 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    # Value embedding optimizer (from modded-nanogpt)
+    if base_model.num_value_embeds > 0:
+        ve_params = list(base_model.value_embeds.parameters())
+        optimizer_ve = torch.optim.Adam(
+            [{"params": ve_params, "lr": args.value_embed_lr, "base_lr": args.value_embed_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=True,
+        )
+        optimizers.append(optimizer_ve)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1250,8 +1368,15 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        # Muon momentum schedule: warmup + cooldown (from modded-nanogpt)
+        if args.muon_momentum_warmup_steps > 0 and step < args.muon_momentum_warmup_steps:
+            frac = step / args.muon_momentum_warmup_steps
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        elif args.muon_momentum_cooldown_steps > 0 and step > args.iterations - args.muon_momentum_cooldown_steps:
+            frac = (step - (args.iterations - args.muon_momentum_cooldown_steps)) / args.muon_momentum_cooldown_steps
+            muon_momentum = args.muon_momentum - frac * (args.muon_momentum - args.muon_momentum_warmup_start)
+        else:
+            muon_momentum = args.muon_momentum
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
 
