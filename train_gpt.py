@@ -715,8 +715,10 @@ class GPT(nn.Module):
 
         # Value embeddings from modded-nanogpt (@KoszarskyB, @Grad62304977).
         # Separate embedding tables injected as V deltas at specific layers.
+        # Must match kv_dim (num_kv_heads * head_dim) since they're added to c_v output.
         self.num_value_embeds = num_value_embeds
-        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(num_value_embeds)])
+        kv_dim = num_kv_heads * (model_dim // num_heads)
+        self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, kv_dim) for _ in range(num_value_embeds)])
         for ve in self.value_embeds:
             nn.init.zeros_(ve.weight)
 
