@@ -84,6 +84,7 @@ class Hyperparameters:
     # Recursive layers: loop shared blocks with per-loop LoRA deltas
     num_loops = int(os.environ.get("NUM_LOOPS", 2))
     loop_lora_rank = int(os.environ.get("LOOP_LORA_RANK", 64))
+    bitlinear_mlp = bool(int(os.environ.get("BITLINEAR_MLP", "1")))
     # SWA: stochastic weight averaging
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -516,6 +517,18 @@ class CastedLinear(nn.Linear):
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
+class BitLinear(nn.Linear):
+    """Ternary {-1,0,+1} weight QAT via absmean quantization + STE (BitNet b1.58)."""
+    def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if self.training and w.ndim == 2:
+            with torch.no_grad():
+                w_scale = 1.0 / (w.float().abs().mean() + 1e-8)
+                w_q = torch.clamp(torch.round(w.float() * w_scale), -1, 1).to(x.dtype) / w_scale
+            w = w + (w_q - w).detach()
+        bias = self.bias.to(x.dtype) if self.bias is not None else None
+        return F.linear(x, w, bias)
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
@@ -606,11 +619,12 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: float, use_bitlinear: bool = False):
         super().__init__()
         hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
+        Lin = BitLinear if use_bitlinear else CastedLinear
+        self.fc = Lin(dim, hidden, bias=False)
+        self.proj = Lin(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -618,20 +632,13 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 class Block(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        mlp_mult: int,
-        rope_base: float,
-        qk_gain_init: float,
-    ):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, use_bitlinear: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, use_bitlinear=use_bitlinear)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -707,6 +714,7 @@ class GPT(nn.Module):
         bigram_dim: int = 128,
         num_loops: int = 1,
         loop_lora_rank: int = 64,
+        bitlinear_mlp: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -726,7 +734,8 @@ class GPT(nn.Module):
         # Shared blocks (looped num_loops times)
         self.num_unique_layers = num_layers
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                  use_bitlinear=bitlinear_mlp)
             for _ in range(num_layers)
         ])
         # Per-loop LoRA deltas for recursion (loop 0 has no delta, loops 1+ have LoRA)
@@ -1124,6 +1133,7 @@ def main() -> None:
         bigram_dim=args.bigram_dim,
         num_loops=args.num_loops,
         loop_lora_rank=args.loop_lora_rank,
+        bitlinear_mlp=args.bitlinear_mlp,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
