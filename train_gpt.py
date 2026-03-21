@@ -518,13 +518,21 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w, bias)
 
 class BitLinear(nn.Linear):
-    """Ternary {-1,0,+1} weight QAT via absmean quantization + STE (BitNet b1.58)."""
+    _global_step = 0
+    _warmup_steps = 500
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
         if self.training and w.ndim == 2:
             with torch.no_grad():
-                w_scale = 1.0 / (w.float().abs().mean() + 1e-8)
-                w_q = torch.clamp(torch.round(w.float() * w_scale), -1, 1).to(x.dtype) / w_scale
+                w32 = w.float()
+                if BitLinear._global_step < BitLinear._warmup_steps:
+                    clip_abs = torch.quantile(w32.abs(), INT8_CLIP_Q, dim=1).clamp_min(1e-8)
+                    scale = clip_abs / INT6_QUANT_RANGE
+                    w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
+                    w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(x.dtype)
+                else:
+                    w_scale = 1.0 / (w32.abs().mean() + 1e-8)
+                    w_q = (torch.clamp(torch.round(w32 * w_scale), -1, 1) / w_scale).to(x.dtype)
             w = w + (w_q - w).detach()
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
@@ -1144,28 +1152,17 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied lm_head (Adam) uses HEAD_LR
-    # - matrix params in transformer blocks use MATRIX_LR via Muon
-    # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    matrix_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    bitlinear_ids = {id(p) for m in base_model.modules() if isinstance(m, BitLinear) for p in m.parameters()}
+    is_ctrl = lambda n: any(p in n for p in CONTROL_TENSOR_NAME_PATTERNS)
+    matrix_params = [p for n, p in block_named_params if p.ndim == 2 and not is_ctrl(n) and id(p) not in bitlinear_ids]
+    bitlinear_params = [p for n, p in block_named_params if id(p) in bitlinear_ids and p.ndim == 2]
+    scalar_params = [p for n, p in block_named_params if p.ndim < 2 or is_ctrl(n)]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if base_model.smear_gate is not None:
         for p in base_model.smear_gate.parameters():
             scalar_params.append(p)
-    # Loop LoRA and BigramHash params go into scalar optimizer
     for p in base_model.loop_loras.parameters():
         scalar_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1193,6 +1190,12 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if bitlinear_params:
+        optimizer_bit = torch.optim.Adam(
+            [{"params": bitlinear_params, "lr": args.matrix_lr * 0.5, "base_lr": args.matrix_lr * 0.5}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+        )
+        optimizers.append(optimizer_bit)
     # BigramHash optimizer
     if base_model.bigram_hash is not None:
         bh_params = list(base_model.bigram_hash.parameters())
@@ -1372,6 +1375,7 @@ def main() -> None:
                 swa_count += 1
 
         step += 1
+        BitLinear._global_step = step
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
